@@ -27,6 +27,25 @@ const TIMEFRAMES = [
   { key: "1y", label: "Année" },
 ];
 
+const ALLOWED_TYPES = new Set(["EQUITY", "ETF", "CRYPTOCURRENCY", "INDEX", "MUTUALFUND"]);
+
+function typeLabel(quoteType) {
+  switch (quoteType) {
+    case "EQUITY":
+      return "Action";
+    case "ETF":
+      return "ETF";
+    case "CRYPTOCURRENCY":
+      return "Crypto";
+    case "INDEX":
+      return "Indice";
+    case "MUTUALFUND":
+      return "Fonds";
+    default:
+      return quoteType || "Actif";
+  }
+}
+
 // ---------- network helper ----------
 
 async function fetchJSON(url) {
@@ -139,24 +158,7 @@ function parseGdeltDate(s) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-function cryptoParamsFor(tf) {
-  switch (tf) {
-    case "4h":
-      return { days: 1, interval: null, slice: 48, demoN: 32 };
-    case "1d":
-      return { days: 1, interval: null, slice: null, demoN: 40 };
-    case "1w":
-      return { days: 7, interval: null, slice: null, demoN: 56 };
-    case "1m":
-      return { days: 30, interval: "daily", slice: null, demoN: 30 };
-    case "1y":
-      return { days: 365, interval: "daily", slice: null, demoN: 52 };
-    default:
-      return { days: 1, interval: null, slice: null, demoN: 40 };
-  }
-}
-
-function stockParamsFor(tf) {
+function paramsFor(tf) {
   switch (tf) {
     case "4h":
       return { interval: "15m", range: "5d", slice: 16, demoN: 16 };
@@ -337,16 +339,14 @@ function StatCard({ label, value, tone }) {
 // ---------- main component ----------
 
 export default function App() {
-  const [assetType, setAssetType] = useState("crypto");
   const [query, setQuery] = useState("");
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState(null);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(null); // { symbol, name, quoteType }
   const [timeframe, setTimeframe] = useState("1d");
   const [series, setSeries] = useState([]);
-  const [assetLabel, setAssetLabel] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [news, setNews] = useState(null);
@@ -355,8 +355,9 @@ export default function App() {
   const [demoActive, setDemoActive] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
+  // recherche unifiée (actions, ETF, crypto) via Yahoo Finance
   useEffect(() => {
-    if (assetType !== "crypto" || !dropdownOpen || query.trim().length < 2) {
+    if (!dropdownOpen || query.trim().length < 2) {
       setSuggestions([]);
       setSearchLoading(false);
       return;
@@ -366,9 +367,20 @@ export default function App() {
     const t = setTimeout(async () => {
       try {
         const data = await fetchJSON(
-          `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(query.trim())}`
+          `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
+            query.trim()
+          )}&quotesCount=8&newsCount=0`
         );
-        setSuggestions((data.coins || []).slice(0, 6));
+        const quotes = (data.quotes || [])
+          .filter((q) => ALLOWED_TYPES.has(q.quoteType) && q.symbol)
+          .map((q) => ({
+            symbol: q.symbol,
+            name: q.longname || q.shortname || q.symbol,
+            quoteType: q.quoteType,
+            exchange: q.exchDisp || q.exchange || "",
+          }))
+          .slice(0, 8);
+        setSuggestions(quotes);
       } catch (e) {
         setSuggestions([]);
         setSearchError("Recherche indisponible pour le moment — réessaie dans un instant.");
@@ -377,12 +389,11 @@ export default function App() {
       }
     }, 350);
     return () => clearTimeout(t);
-  }, [query, assetType, dropdownOpen]);
+  }, [query, dropdownOpen]);
 
   useEffect(() => {
     if (!selected) return;
-    if (selected.kind === "crypto") loadCrypto(selected);
-    else loadStock(selected);
+    loadAsset(selected);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, timeframe]);
 
@@ -395,34 +406,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
 
-  async function loadCrypto(asset) {
+  async function loadAsset(asset) {
     setLoading(true);
     setError(null);
-    const { days, interval, slice, demoN } = cryptoParamsFor(timeframe);
-    try {
-      const url = `https://api.coingecko.com/api/v3/coins/${asset.id}/market_chart?vs_currency=usd&days=${days}${
-        interval ? `&interval=${interval}` : ""
-      }`;
-      const data = await fetchJSON(url);
-      let points = (data.prices || []).map((p) => ({ time: p[0], price: p[1] }));
-      if (slice) points = points.slice(-slice);
-      if (points.length === 0) throw new Error("no_data");
-      setSeries(downsample(points, 150));
-      setDemoActive(false);
-      setLastUpdate(new Date());
-    } catch (err) {
-      setSeries(generateDemoSeries(asset.id + timeframe, demoN));
-      setDemoActive(true);
-      setError("Source de données crypto indisponible pour le moment — affichage en mode démo.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function loadStock(asset) {
-    setLoading(true);
-    setError(null);
-    const { interval, range, slice, demoN } = stockParamsFor(timeframe);
+    const { interval, range, slice, demoN } = paramsFor(timeframe);
     try {
       const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
         asset.symbol
@@ -437,15 +424,13 @@ export default function App() {
         .filter((p) => p.price != null);
       if (slice) points = points.slice(-slice);
       if (points.length === 0) throw new Error("aucune donnée renvoyée");
-      setAssetLabel(result.meta?.shortName || result.meta?.longName || asset.symbol);
       setSeries(downsample(points, 150));
       setDemoActive(false);
       setLastUpdate(new Date());
     } catch (err) {
-      setAssetLabel(asset.symbol);
       setSeries(generateDemoSeries(asset.symbol + timeframe, demoN));
       setDemoActive(true);
-      setError("Source de données indisponible pour ce symbole pour le moment — affichage en mode démo.");
+      setError("Source de données indisponible pour cet actif — affichage en mode démo.");
     } finally {
       setLoading(false);
     }
@@ -455,7 +440,7 @@ export default function App() {
     setNewsLoading(true);
     setNewsError(null);
     try {
-      const term = asset.kind === "crypto" ? `${asset.name} crypto` : `${asset.symbol} stock`;
+      const term = `${asset.name} ${asset.symbol}`;
       const encoded = encodeURIComponent(term);
       const artUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=artlist&maxrecords=6&format=json&sort=datedesc&timespan=3d`;
       const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=timelinetone&format=json&timespan=7d`;
@@ -479,21 +464,9 @@ export default function App() {
     }
   }
 
-  function handleTypeChange(type) {
-    setAssetType(type);
-    setSelected(null);
-    setSeries([]);
-    setQuery("");
-    setSuggestions([]);
-    setError(null);
-    setNews(null);
-    setAssetLabel(null);
-    setDemoActive(false);
-  }
-
-  function selectCrypto(coin) {
-    setSelected({ id: coin.id, symbol: (coin.symbol || coin.id).toUpperCase(), name: coin.name, kind: "crypto" });
-    setQuery(`${coin.name} (${(coin.symbol || "").toUpperCase()})`);
+  function selectAsset(item) {
+    setSelected({ symbol: item.symbol, name: item.name, quoteType: item.quoteType });
+    setQuery(`${item.name} (${item.symbol})`);
     setDropdownOpen(false);
     setSuggestions([]);
   }
@@ -502,29 +475,33 @@ export default function App() {
     e.preventDefault();
     const q = query.trim();
     if (!q) return;
-    if (assetType === "crypto") {
-      if (suggestions.length > 0) {
-        selectCrypto(suggestions[0]);
-        return;
-      }
-      setSearchLoading(true);
-      setSearchError(null);
-      try {
-        const data = await fetchJSON(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(q)}`);
-        const coins = data.coins || [];
-        if (coins.length > 0) selectCrypto(coins[0]);
-        else setSearchError("Aucun résultat pour cette recherche.");
-      } catch {
-        setSearchError("Recherche indisponible — réessaie dans un instant.");
-      } finally {
-        setSearchLoading(false);
-      }
+    if (suggestions.length > 0) {
+      selectAsset(suggestions[0]);
       return;
     }
-    const sym = q.toUpperCase();
-    setAssetLabel(sym);
-    setSelected({ id: sym, symbol: sym, name: sym, kind: "stock" });
-    setDropdownOpen(false);
+    setSearchLoading(true);
+    setSearchError(null);
+    try {
+      const data = await fetchJSON(
+        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`
+      );
+      const quotes = (data.quotes || []).filter((x) => ALLOWED_TYPES.has(x.quoteType) && x.symbol);
+      if (quotes.length > 0) {
+        selectAsset({
+          symbol: quotes[0].symbol,
+          name: quotes[0].longname || quotes[0].shortname || quotes[0].symbol,
+          quoteType: quotes[0].quoteType,
+        });
+      } else {
+        setSearchError("Aucun résultat — recherche directe avec ce texte comme symbole.");
+        selectAsset({ symbol: q.toUpperCase(), name: q, quoteType: "EQUITY" });
+      }
+    } catch {
+      setSearchError("Recherche indisponible — recherche directe avec ce texte comme symbole.");
+      selectAsset({ symbol: q.toUpperCase(), name: q, quoteType: "EQUITY" });
+    } finally {
+      setSearchLoading(false);
+    }
   }
 
   const prices = useMemo(() => series.map((p) => p.price), [series]);
@@ -544,7 +521,6 @@ export default function App() {
   }, [technical, newsFactorInfo]);
 
   const currentPrice = prices.length ? prices[prices.length - 1] : null;
-  const displayName = assetType === "stock" ? assetLabel || selected?.symbol : selected?.name;
 
   return (
     <div className="bsl-app">
@@ -570,7 +546,7 @@ export default function App() {
           margin: 0 auto;
         }
         .bsl-app * { box-sizing: border-box; }
-        .bsl-shell { display: grid; grid-template-columns: 220px 1fr; gap: 18px; }
+        .bsl-shell { display: grid; grid-template-columns: 200px 1fr; gap: 18px; }
         @media (max-width: 780px) { .bsl-shell { grid-template-columns: 1fr; } }
 
         .bsl-panel {
@@ -624,7 +600,7 @@ export default function App() {
         .bsl-topbar { padding: 16px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
         .bsl-topbar-title h2 { font-family: var(--font-display); font-size: 18px; margin: 0; font-weight: 600; }
         .bsl-topbar-title p { font-size: 11.5px; color: var(--text-dim); margin: 2px 0 0; }
-        .bsl-search-wrap { position: relative; display: flex; gap: 8px; flex: 1; max-width: 460px; min-width: 220px; }
+        .bsl-search-wrap { position: relative; display: flex; gap: 8px; flex: 1; max-width: 480px; min-width: 240px; }
         .bsl-search-input { position: relative; flex: 1; }
         .bsl-search-input svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-dim); }
         .bsl-search-input input {
@@ -644,15 +620,20 @@ export default function App() {
         .bsl-dropdown {
           position: absolute; top: calc(100% + 6px); left: 0; right: 0; background: var(--bg-panel-2);
           border: 1px solid var(--border); border-radius: 10px; overflow: hidden; z-index: 5;
-          backdrop-filter: blur(18px);
+          backdrop-filter: blur(18px); max-height: 320px; overflow-y: auto;
         }
         .bsl-dropdown button {
           display: flex; width: 100%; align-items: center; gap: 10px; padding: 9px 12px; background: transparent;
           border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; font-family: var(--font);
         }
         .bsl-dropdown button:hover, .bsl-dropdown button:focus-visible { background: rgba(255,255,255,0.05); outline: none; }
-        .bsl-dropdown img { width: 18px; height: 18px; border-radius: 50%; }
-        .bsl-dropdown .sym { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; }
+        .bsl-dropdown .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bsl-dropdown .sym { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; flex-shrink: 0; }
+        .bsl-dropdown .type-pill {
+          font-size: 9.5px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px;
+          background: rgba(176,132,245,0.14); color: var(--purple); border: 1px solid rgba(176,132,245,0.3); flex-shrink: 0;
+        }
+        .bsl-dropdown .type-pill.CRYPTOCURRENCY { background: rgba(52,217,160,0.12); color: var(--buy); border-color: rgba(52,217,160,0.3); }
         .bsl-dropdown .msg { padding: 10px 12px; font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; }
 
         .bsl-timeframes { display: flex; gap: 6px; padding: 0 2px; flex-wrap: wrap; }
@@ -679,9 +660,14 @@ export default function App() {
         @media (max-width: 780px) { .bsl-grid-2 { grid-template-columns: 1fr; } }
 
         .bsl-chart-panel, .bsl-signal-panel, .bsl-news-panel, .bsl-detail-panel { padding: 18px; }
-        .bsl-panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+        .bsl-panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; gap: 10px; flex-wrap: wrap; }
         .bsl-panel-head h3 { font-family: var(--font-display); font-size: 14px; margin: 0; font-weight: 600; }
-        .bsl-panel-head .sub { font-size: 11px; color: var(--text-dim); }
+        .bsl-panel-head .sub { font-size: 11px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+        .bsl-type-pill {
+          font-size: 9.5px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px;
+          background: rgba(176,132,245,0.14); color: var(--purple); border: 1px solid rgba(176,132,245,0.3);
+        }
+        .bsl-type-pill.CRYPTOCURRENCY { background: rgba(52,217,160,0.12); color: var(--buy); border-color: rgba(52,217,160,0.3); }
 
         .bsl-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 50px 20px; color: var(--text-dim); text-align: center; gap: 10px; }
         .bsl-loading { display: flex; align-items: center; justify-content: center; padding: 50px 0; color: var(--text-dim); gap: 8px; }
@@ -731,18 +717,6 @@ export default function App() {
           </div>
 
           <div>
-            <div className="bsl-menu-label">Marché</div>
-            <div className="bsl-nav">
-              <button className={assetType === "crypto" ? "active" : ""} onClick={() => handleTypeChange("crypto")}>
-                <span className="dot" /> Crypto
-              </button>
-              <button className={assetType === "stock" ? "active" : ""} onClick={() => handleTypeChange("stock")}>
-                <span className="dot" /> Action / ETF
-              </button>
-            </div>
-          </div>
-
-          <div>
             <div className="bsl-menu-label">Période</div>
             <div className="bsl-nav">
               {TIMEFRAMES.map((tf) => (
@@ -774,7 +748,7 @@ export default function App() {
           <div className="bsl-panel bsl-topbar">
             <div className="bsl-topbar-title">
               <h2>Panneau d'instruments</h2>
-              <p>Recherche & synthèse technique + actualités</p>
+              <p>Actions, ETF et crypto — une seule recherche</p>
             </div>
             <div className="bsl-search-wrap">
               <form onSubmit={handleSubmit} style={{ display: "flex", gap: 8, width: "100%" }}>
@@ -782,7 +756,7 @@ export default function App() {
                   <Search size={15} />
                   <input
                     type="text"
-                    placeholder={assetType === "crypto" ? "bitcoin, eth, solana…" : "AAPL, MSFT, SPY…"}
+                    placeholder="TotalEnergies, bitcoin, AAPL, MSCI World…"
                     value={query}
                     onChange={(e) => {
                       setQuery(e.target.value);
@@ -790,7 +764,7 @@ export default function App() {
                       setSearchError(null);
                     }}
                   />
-                  {assetType === "crypto" && dropdownOpen && query.trim().length >= 2 && (
+                  {dropdownOpen && query.trim().length >= 2 && (
                     <div className="bsl-dropdown">
                       {searchLoading && (
                         <div className="msg"><Loader2 size={13} className="bsl-spin" /> Recherche…</div>
@@ -800,11 +774,11 @@ export default function App() {
                         <div className="msg">Appuie sur Entrée pour lancer la recherche.</div>
                       )}
                       {!searchLoading &&
-                        suggestions.map((c) => (
-                          <button key={c.id} type="button" onClick={() => selectCrypto(c)}>
-                            {c.thumb && <img src={c.thumb} alt="" />}
-                            <span>{c.name}</span>
-                            <span className="sym">{c.symbol?.toUpperCase()}</span>
+                        suggestions.map((s) => (
+                          <button key={s.symbol} type="button" onClick={() => selectAsset(s)}>
+                            <span className="name">{s.name}</span>
+                            <span className="sym">{s.symbol}</span>
+                            <span className={`type-pill ${s.quoteType}`}>{typeLabel(s.quoteType)}</span>
                           </button>
                         ))}
                     </div>
@@ -848,12 +822,21 @@ export default function App() {
             <div className="bsl-panel bsl-chart-panel">
               <div className="bsl-panel-head">
                 <h3>Évolution du cours</h3>
-                <span className="sub">{displayName ? `${displayName} · ${selected.symbol}` : "En attente"}</span>
+                <span className="sub">
+                  {selected ? (
+                    <>
+                      {selected.name} · {selected.symbol}
+                      <span className={`bsl-type-pill ${selected.quoteType}`}>{typeLabel(selected.quoteType)}</span>
+                    </>
+                  ) : (
+                    "En attente"
+                  )}
+                </span>
               </div>
               {!selected ? (
                 <div className="bsl-empty">
                   <Search size={26} color="var(--text-dim)" />
-                  <p>Recherche une crypto, une action ou un ETF pour afficher son cours.</p>
+                  <p>Recherche une action, un ETF ou une crypto pour afficher son cours.</p>
                 </div>
               ) : loading ? (
                 <div className="bsl-loading"><Loader2 size={18} className="bsl-spin" /> Chargement…</div>
@@ -964,11 +947,9 @@ export default function App() {
           </div>
 
           <div className="bsl-footer">
-            Si une source de données (marché ou actualités) est temporairement indisponible — limite de taux,
-            panne, blocage réseau — l'application bascule automatiquement en <strong>mode démo</strong> clairement
-            indiqué, avec des données simulées. Sources en conditions normales : CoinGecko (crypto), Yahoo Finance
-            (actions/ETF), GDELT (actualités) — toutes publiques, sans clé requise. Ceci reste un outil informatif,
-            pas un conseil financier.
+            Recherche unifiée (actions, ETF, crypto) via Yahoo Finance — sans clé API. Si une source de données est
+            temporairement indisponible, l'application bascule automatiquement en <strong>mode démo</strong>
+            clairement indiqué. Ceci reste un outil informatif, pas un conseil financier.
           </div>
         </div>
       </div>
