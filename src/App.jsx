@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   AreaChart,
   Area,
@@ -17,6 +17,7 @@ import {
   Loader2,
   ExternalLink,
   Radio,
+  X,
 } from "lucide-react";
 
 const TIMEFRAMES = [
@@ -25,6 +26,14 @@ const TIMEFRAMES = [
   { key: "1w", label: "Semaine" },
   { key: "1m", label: "Mois" },
   { key: "1y", label: "Année" },
+];
+
+const FILTERS = [
+  { key: "ALL", label: "Tous" },
+  { key: "EQUITY", label: "Actions" },
+  { key: "ETF", label: "ETF" },
+  { key: "CRYPTOCURRENCY", label: "Crypto" },
+  { key: "INDEX", label: "Indices" },
 ];
 
 const ALLOWED_TYPES = new Set(["EQUITY", "ETF", "CRYPTOCURRENCY", "INDEX", "MUTUALFUND"]);
@@ -46,23 +55,13 @@ function typeLabel(quoteType) {
   }
 }
 
-// ---------- network helper ----------
-
-async function fetchJSON(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("http_" + res.status);
-    return await res.json();
-  } catch (e) {
-    // repli via un proxy CORS public si l'appel direct échoue
-    const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-    const res2 = await fetch(proxied);
-    if (!res2.ok) throw new Error("proxy_http_" + res2.status);
-    return await res2.json();
-  }
-}
-
-// ---------- mode démo (repli si une source de données est indisponible) ----------
+const AVATAR_PAIRS = [
+  ["#4FD8EA", "#B084F5"],
+  ["#34D9A0", "#4FD8EA"],
+  ["#F5B942", "#F2607A"],
+  ["#B084F5", "#F2607A"],
+  ["#34D9A0", "#F5B942"],
+];
 
 function hashStr(s) {
   let h = 0;
@@ -72,6 +71,51 @@ function hashStr(s) {
   }
   return h;
 }
+
+function avatarGradient(symbol) {
+  const [a, b] = AVATAR_PAIRS[Math.abs(hashStr(symbol)) % AVATAR_PAIRS.length];
+  return `linear-gradient(135deg, ${a}, ${b})`;
+}
+
+// ---------- network helpers ----------
+
+async function fetchWithTimeout(url, ms = 6000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error("http_" + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function fetchJSON(url) {
+  try {
+    return await fetchWithTimeout(url, 6000);
+  } catch (e) {
+    const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+    return await fetchWithTimeout(proxied, 8000);
+  }
+}
+
+async function searchYahoo(q) {
+  const hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
+  let lastErr;
+  for (const host of hosts) {
+    try {
+      return await fetchJSON(
+        `https://${host}/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=12&newsCount=0`
+      );
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
+// ---------- mode démo (repli si une source de données est indisponible) ----------
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -336,14 +380,141 @@ function StatCard({ label, value, tone }) {
   );
 }
 
+// ---------- search modal (façon TradingView) ----------
+
+function SearchModal({ query, setQuery, onClose, onSelect }) {
+  const [activeFilter, setActiveFilter] = useState("ALL");
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    function onKey(e) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (query.trim().length < 2) {
+      setResults([]);
+      setError(null);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    const t = setTimeout(async () => {
+      try {
+        const data = await searchYahoo(query.trim());
+        const quotes = (data.quotes || [])
+          .filter((q) => ALLOWED_TYPES.has(q.quoteType) && q.symbol)
+          .map((q) => ({
+            symbol: q.symbol,
+            name: q.longname || q.shortname || q.symbol,
+            quoteType: q.quoteType,
+            exchange: q.exchDisp || q.exchange || "",
+          }));
+        setResults(quotes);
+      } catch (e) {
+        setResults([]);
+        setError("Recherche indisponible pour le moment — réessaie dans un instant.");
+      } finally {
+        setLoading(false);
+      }
+    }, 320);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  const filtered = activeFilter === "ALL" ? results : results.filter((r) => r.quoteType === activeFilter);
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (filtered.length > 0) {
+      onSelect(filtered[0]);
+    } else if (query.trim()) {
+      onSelect({ symbol: query.trim().toUpperCase(), name: query.trim(), quoteType: "EQUITY" });
+    }
+  }
+
+  return (
+    <div className="bsl-modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="bsl-modal">
+        <form className="bsl-modal-head" onSubmit={handleSubmit}>
+          <Search size={17} color="var(--text-dim)" />
+          <input
+            ref={inputRef}
+            type="text"
+            placeholder="TotalEnergies, bitcoin, AAPL, MSCI World…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {query && (
+            <button type="button" className="bsl-modal-clear" onClick={() => setQuery("")}>
+              Effacer
+            </button>
+          )}
+          <button type="button" className="bsl-modal-close" onClick={onClose} aria-label="Fermer">
+            <X size={15} />
+          </button>
+        </form>
+
+        <div className="bsl-modal-filters">
+          {FILTERS.map((f) => (
+            <button
+              key={f.key}
+              type="button"
+              className={`bsl-filter-pill ${activeFilter === f.key ? "active" : ""}`}
+              onClick={() => setActiveFilter(f.key)}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="bsl-modal-list">
+          {query.trim().length < 2 ? (
+            <div className="bsl-modal-empty">Tape le nom ou le symbole d'un actif (2 caractères min.)</div>
+          ) : loading ? (
+            <div className="bsl-modal-empty">
+              <Loader2 size={16} className="bsl-spin" style={{ verticalAlign: "middle", marginRight: 8 }} />
+              Recherche…
+            </div>
+          ) : error ? (
+            <div className="bsl-modal-empty">{error}</div>
+          ) : filtered.length === 0 ? (
+            <div className="bsl-modal-empty">Aucun résultat pour « {query} ».</div>
+          ) : (
+            filtered.map((r) => (
+              <button key={r.symbol + r.exchange} type="button" className="bsl-result-row" onClick={() => onSelect(r)}>
+                <span className="bsl-avatar" style={{ background: avatarGradient(r.symbol) }}>
+                  {r.symbol.slice(0, 2)}
+                </span>
+                <span className="bsl-result-main">
+                  <span className="bsl-result-sym">{r.symbol}</span>
+                  <span className="bsl-result-name">{r.name}</span>
+                </span>
+                <span className="bsl-result-meta">
+                  <span className="bsl-result-exch">{r.exchange}</span>
+                  <span className={`bsl-type-pill ${r.quoteType}`}>{typeLabel(r.quoteType)}</span>
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------- main component ----------
 
 export default function App() {
   const [query, setQuery] = useState("");
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [suggestions, setSuggestions] = useState([]);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState(null);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [selected, setSelected] = useState(null); // { symbol, name, quoteType }
   const [timeframe, setTimeframe] = useState("1d");
   const [series, setSeries] = useState([]);
@@ -354,42 +525,6 @@ export default function App() {
   const [newsError, setNewsError] = useState(null);
   const [demoActive, setDemoActive] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
-
-  // recherche unifiée (actions, ETF, crypto) via Yahoo Finance
-  useEffect(() => {
-    if (!dropdownOpen || query.trim().length < 2) {
-      setSuggestions([]);
-      setSearchLoading(false);
-      return;
-    }
-    setSearchLoading(true);
-    setSearchError(null);
-    const t = setTimeout(async () => {
-      try {
-        const data = await fetchJSON(
-          `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
-            query.trim()
-          )}&quotesCount=8&newsCount=0`
-        );
-        const quotes = (data.quotes || [])
-          .filter((q) => ALLOWED_TYPES.has(q.quoteType) && q.symbol)
-          .map((q) => ({
-            symbol: q.symbol,
-            name: q.longname || q.shortname || q.symbol,
-            quoteType: q.quoteType,
-            exchange: q.exchDisp || q.exchange || "",
-          }))
-          .slice(0, 8);
-        setSuggestions(quotes);
-      } catch (e) {
-        setSuggestions([]);
-        setSearchError("Recherche indisponible pour le moment — réessaie dans un instant.");
-      } finally {
-        setSearchLoading(false);
-      }
-    }, 350);
-    return () => clearTimeout(t);
-  }, [query, dropdownOpen]);
 
   useEffect(() => {
     if (!selected) return;
@@ -464,44 +599,10 @@ export default function App() {
     }
   }
 
-  function selectAsset(item) {
+  function handleSelect(item) {
     setSelected({ symbol: item.symbol, name: item.name, quoteType: item.quoteType });
     setQuery(`${item.name} (${item.symbol})`);
-    setDropdownOpen(false);
-    setSuggestions([]);
-  }
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    const q = query.trim();
-    if (!q) return;
-    if (suggestions.length > 0) {
-      selectAsset(suggestions[0]);
-      return;
-    }
-    setSearchLoading(true);
-    setSearchError(null);
-    try {
-      const data = await fetchJSON(
-        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`
-      );
-      const quotes = (data.quotes || []).filter((x) => ALLOWED_TYPES.has(x.quoteType) && x.symbol);
-      if (quotes.length > 0) {
-        selectAsset({
-          symbol: quotes[0].symbol,
-          name: quotes[0].longname || quotes[0].shortname || quotes[0].symbol,
-          quoteType: quotes[0].quoteType,
-        });
-      } else {
-        setSearchError("Aucun résultat — recherche directe avec ce texte comme symbole.");
-        selectAsset({ symbol: q.toUpperCase(), name: q, quoteType: "EQUITY" });
-      }
-    } catch {
-      setSearchError("Recherche indisponible — recherche directe avec ce texte comme symbole.");
-      selectAsset({ symbol: q.toUpperCase(), name: q, quoteType: "EQUITY" });
-    } finally {
-      setSearchLoading(false);
-    }
+    setSearchOpen(false);
   }
 
   const prices = useMemo(() => series.map((p) => p.price), [series]);
@@ -527,7 +628,7 @@ export default function App() {
       <style>{`
         .bsl-app {
           --bg-panel: rgba(19,26,61,0.55);
-          --bg-panel-2: rgba(15,20,48,0.65);
+          --bg-panel-2: rgba(15,20,48,0.75);
           --text: #E8ECFF;
           --text-dim: #8891C4;
           --border: rgba(148,163,255,0.16);
@@ -600,41 +701,67 @@ export default function App() {
         .bsl-topbar { padding: 16px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
         .bsl-topbar-title h2 { font-family: var(--font-display); font-size: 18px; margin: 0; font-weight: 600; }
         .bsl-topbar-title p { font-size: 11.5px; color: var(--text-dim); margin: 2px 0 0; }
-        .bsl-search-wrap { position: relative; display: flex; gap: 8px; flex: 1; max-width: 480px; min-width: 240px; }
-        .bsl-search-input { position: relative; flex: 1; }
-        .bsl-search-input svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-dim); }
-        .bsl-search-input input {
-          width: 100%; background: var(--bg-panel-2); border: 1px solid var(--border); border-radius: 10px;
-          padding: 9px 10px 9px 34px; color: var(--text); font-family: var(--font); font-size: 13px;
+
+        .bsl-search-trigger {
+          display: flex; align-items: center; gap: 8px; flex: 1; max-width: 420px; min-width: 220px;
+          background: var(--bg-panel-2); border: 1px solid var(--border); border-radius: 10px;
+          padding: 9px 12px; color: var(--text-dim); font-size: 13px; cursor: pointer; text-align: left;
           transition: border-color 0.15s;
         }
-        .bsl-search-input input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
-        .bsl-run-btn {
-          border: none; border-radius: 999px; padding: 0 18px; font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
-          color: #08101f; background: linear-gradient(120deg, var(--cyan), var(--purple)); cursor: pointer;
-          transition: transform 0.15s, box-shadow 0.15s;
+        .bsl-search-trigger:hover { border-color: rgba(79,216,234,0.4); }
+        .bsl-search-trigger:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
+        .bsl-search-trigger .val { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .bsl-modal-overlay {
+          position: fixed; inset: 0; background: rgba(4,6,18,0.72); backdrop-filter: blur(6px);
+          z-index: 60; display: flex; justify-content: center; padding: 8vh 16px 16px;
         }
-        .bsl-run-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 20px -8px rgba(79,216,234,0.5); }
-        .bsl-run-btn:disabled { opacity: 0.6; cursor: default; }
-        .bsl-run-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
-        .bsl-dropdown {
-          position: absolute; top: calc(100% + 6px); left: 0; right: 0; background: var(--bg-panel-2);
-          border: 1px solid var(--border); border-radius: 10px; overflow: hidden; z-index: 5;
-          backdrop-filter: blur(18px); max-height: 320px; overflow-y: auto;
+        .bsl-modal {
+          width: min(640px, 100%); max-height: 78vh; display: flex; flex-direction: column;
+          background: var(--bg-panel-2); border: 1px solid var(--border); border-radius: 16px;
+          backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
+          box-shadow: 0 50px 90px -20px rgba(0,0,0,0.65); overflow: hidden;
         }
-        .bsl-dropdown button {
-          display: flex; width: 100%; align-items: center; gap: 10px; padding: 9px 12px; background: transparent;
-          border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; font-family: var(--font);
+        .bsl-modal-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+        .bsl-modal-head input {
+          flex: 1; background: transparent; border: none; color: var(--text); font-size: 15px;
+          font-family: var(--font);
         }
-        .bsl-dropdown button:hover, .bsl-dropdown button:focus-visible { background: rgba(255,255,255,0.05); outline: none; }
-        .bsl-dropdown .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .bsl-dropdown .sym { color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; flex-shrink: 0; }
-        .bsl-dropdown .type-pill {
-          font-size: 9.5px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px;
-          background: rgba(176,132,245,0.14); color: var(--purple); border: 1px solid rgba(176,132,245,0.3); flex-shrink: 0;
+        .bsl-modal-head input:focus { outline: none; }
+        .bsl-modal-clear { background: transparent; border: none; color: var(--text-dim); font-size: 12px; cursor: pointer; padding: 4px 6px; }
+        .bsl-modal-clear:hover { color: var(--text); }
+        .bsl-modal-close {
+          background: rgba(255,255,255,0.06); border: none; border-radius: 8px; width: 26px; height: 26px;
+          display: flex; align-items: center; justify-content: center; color: var(--text-dim); cursor: pointer; flex-shrink: 0;
         }
-        .bsl-dropdown .type-pill.CRYPTOCURRENCY { background: rgba(52,217,160,0.12); color: var(--buy); border-color: rgba(52,217,160,0.3); }
-        .bsl-dropdown .msg { padding: 10px 12px; font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; }
+        .bsl-modal-close:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+
+        .bsl-modal-filters { display: flex; gap: 6px; padding: 10px 16px; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+        .bsl-filter-pill {
+          background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text-dim);
+          font-size: 12px; padding: 5px 12px; border-radius: 999px; cursor: pointer; font-family: var(--font);
+          transition: all 0.15s;
+        }
+        .bsl-filter-pill:hover { border-color: rgba(79,216,234,0.4); }
+        .bsl-filter-pill.active { background: linear-gradient(120deg, var(--cyan), var(--purple)); border-color: transparent; color: #08101f; font-weight: 700; }
+
+        .bsl-modal-list { overflow-y: auto; flex: 1; }
+        .bsl-modal-empty { padding: 44px 20px; text-align: center; color: var(--text-dim); font-size: 13px; }
+        .bsl-result-row {
+          display: flex; width: 100%; align-items: center; gap: 12px; padding: 11px 16px; cursor: pointer;
+          border: none; background: transparent; border-bottom: 1px solid rgba(255,255,255,0.03);
+          transition: background 0.12s; text-align: left; font-family: var(--font);
+        }
+        .bsl-result-row:hover, .bsl-result-row:focus-visible { background: rgba(255,255,255,0.05); outline: none; }
+        .bsl-avatar {
+          width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+          font-family: var(--font-display); font-weight: 700; font-size: 11.5px; color: #08101f; flex-shrink: 0;
+        }
+        .bsl-result-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+        .bsl-result-sym { font-family: var(--font-mono); font-weight: 600; font-size: 13.5px; color: var(--text); }
+        .bsl-result-name { font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bsl-result-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .bsl-result-exch { font-size: 11px; color: var(--text-dim); }
 
         .bsl-timeframes { display: flex; gap: 6px; padding: 0 2px; flex-wrap: wrap; }
         .bsl-timeframes button {
@@ -750,45 +877,10 @@ export default function App() {
               <h2>Panneau d'instruments</h2>
               <p>Actions, ETF et crypto — une seule recherche</p>
             </div>
-            <div className="bsl-search-wrap">
-              <form onSubmit={handleSubmit} style={{ display: "flex", gap: 8, width: "100%" }}>
-                <div className="bsl-search-input">
-                  <Search size={15} />
-                  <input
-                    type="text"
-                    placeholder="TotalEnergies, bitcoin, AAPL, MSCI World…"
-                    value={query}
-                    onChange={(e) => {
-                      setQuery(e.target.value);
-                      setDropdownOpen(true);
-                      setSearchError(null);
-                    }}
-                  />
-                  {dropdownOpen && query.trim().length >= 2 && (
-                    <div className="bsl-dropdown">
-                      {searchLoading && (
-                        <div className="msg"><Loader2 size={13} className="bsl-spin" /> Recherche…</div>
-                      )}
-                      {!searchLoading && searchError && <div className="msg">{searchError}</div>}
-                      {!searchLoading && !searchError && suggestions.length === 0 && (
-                        <div className="msg">Appuie sur Entrée pour lancer la recherche.</div>
-                      )}
-                      {!searchLoading &&
-                        suggestions.map((s) => (
-                          <button key={s.symbol} type="button" onClick={() => selectAsset(s)}>
-                            <span className="name">{s.name}</span>
-                            <span className="sym">{s.symbol}</span>
-                            <span className={`type-pill ${s.quoteType}`}>{typeLabel(s.quoteType)}</span>
-                          </button>
-                        ))}
-                    </div>
-                  )}
-                </div>
-                <button type="submit" className="bsl-run-btn" disabled={searchLoading}>
-                  {searchLoading ? "…" : "ANALYSER"}
-                </button>
-              </form>
-            </div>
+            <button type="button" className="bsl-search-trigger" onClick={() => setSearchOpen(true)}>
+              <Search size={15} />
+              <span className="val">{query || "Rechercher un actif…"}</span>
+            </button>
           </div>
 
           <div className="bsl-timeframes">
@@ -947,12 +1039,22 @@ export default function App() {
           </div>
 
           <div className="bsl-footer">
-            Recherche unifiée (actions, ETF, crypto) via Yahoo Finance — sans clé API. Si une source de données est
-            temporairement indisponible, l'application bascule automatiquement en <strong>mode démo</strong>
-            clairement indiqué. Ceci reste un outil informatif, pas un conseil financier.
+            Recherche unifiée (actions, ETF, crypto) via Yahoo Finance — sans clé API, avec double repli réseau
+            pour plus de fiabilité. Si une source de données est temporairement indisponible, l'application
+            bascule automatiquement en <strong>mode démo</strong> clairement indiqué. Ceci reste un outil
+            informatif, pas un conseil financier.
           </div>
         </div>
       </div>
+
+      {searchOpen && (
+        <SearchModal
+          query={query}
+          setQuery={setQuery}
+          onClose={() => setSearchOpen(false)}
+          onSelect={handleSelect}
+        />
+      )}
     </div>
   );
 }
