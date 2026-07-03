@@ -1,0 +1,16 @@
+{
+  "name": "Boussole — Radar actions & crypto",
+  "short_name": "Boussole",
+  "description": "Recherche une action, un ETF ou une crypto et obtiens une synthèse technique + actualités.",
+  "start_url": "/boussole/",
+  "scope": "/boussole/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0A0E27",
+  "theme_color": "#0A0E27",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
