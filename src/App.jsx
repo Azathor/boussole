@@ -79,7 +79,7 @@ function avatarGradient(symbol) {
 
 // ---------- network helpers ----------
 
-async function fetchWithTimeout(url, ms = 6000) {
+async function fetchWithTimeout(url, ms = 5000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -92,27 +92,28 @@ async function fetchWithTimeout(url, ms = 6000) {
 }
 
 async function fetchJSON(url) {
-  try {
-    return await fetchWithTimeout(url, 6000);
-  } catch (e) {
-    const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-    return await fetchWithTimeout(proxied, 8000);
-  }
-}
-
-async function searchYahoo(q) {
-  const hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
+  const attempts = [
+    url,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  ];
   let lastErr;
-  for (const host of hosts) {
+  for (const attemptUrl of attempts) {
     try {
-      return await fetchJSON(
-        `https://${host}/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=12&newsCount=0`
-      );
+      return await fetchWithTimeout(attemptUrl, 5000);
     } catch (e) {
       lastErr = e;
     }
   }
   throw lastErr;
+}
+
+async function searchYahoo(q) {
+  const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
+    q
+  )}&quotesCount=12&newsCount=0`;
+  return fetchJSON(url);
 }
 
 // ---------- mode démo (repli si une source de données est indisponible) ----------
@@ -403,6 +404,8 @@ function SearchModal({ query, setQuery, onClose, onSelect }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const [retryTick, setRetryTick] = useState(0);
+
   useEffect(() => {
     if (query.trim().length < 2) {
       setResults([]);
@@ -425,13 +428,13 @@ function SearchModal({ query, setQuery, onClose, onSelect }) {
         setResults(quotes);
       } catch (e) {
         setResults([]);
-        setError("Recherche indisponible pour le moment — réessaie dans un instant.");
+        setError("Recherche indisponible pour le moment.");
       } finally {
         setLoading(false);
       }
     }, 320);
     return () => clearTimeout(t);
-  }, [query]);
+  }, [query, retryTick]);
 
   const filtered = activeFilter === "ALL" ? results : results.filter((r) => r.quoteType === activeFilter);
 
@@ -489,7 +492,13 @@ function SearchModal({ query, setQuery, onClose, onSelect }) {
               Recherche…
             </div>
           ) : error ? (
-            <div className="bsl-modal-empty">{error}</div>
+            <div className="bsl-modal-empty">
+              {error}
+              <br />
+              <button type="button" className="bsl-retry-btn" onClick={() => setRetryTick((n) => n + 1)}>
+                Réessayer
+              </button>
+            </div>
           ) : filtered.length === 0 ? (
             <div className="bsl-modal-empty">Aucun résultat pour « {query} ».</div>
           ) : (
@@ -741,6 +750,11 @@ export default function App() {
 
         .bsl-modal-list { overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; }
         .bsl-modal-empty { padding: 44px 20px; text-align: center; color: var(--text-dim); font-size: 13px; }
+        .bsl-retry-btn {
+          margin-top: 10px; background: rgba(79,216,234,0.1); border: 1px solid rgba(79,216,234,0.3); color: var(--cyan);
+          font-size: 12.5px; padding: 8px 16px; border-radius: 999px; cursor: pointer; font-family: var(--font);
+        }
+        .bsl-retry-btn:hover { background: rgba(79,216,234,0.18); }
         .bsl-result-row {
           display: flex; width: 100%; align-items: center; gap: 12px; padding: 13px 16px; cursor: pointer;
           border: none; background: transparent; border-bottom: 1px solid rgba(255,255,255,0.03);
