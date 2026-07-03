@@ -584,7 +584,9 @@ export default function App() {
       setNews(null);
       return;
     }
-    loadNews(selected);
+    setNewsLoading(true);
+    const t = setTimeout(() => loadNews(selected), 500);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected]);
 
@@ -621,12 +623,26 @@ export default function App() {
   async function loadNews(asset) {
     setNewsLoading(true);
     setNewsError(null);
-    const term = `${asset.name} ${asset.symbol}`;
+    // On utilise uniquement le nom (le symbole, ex. "BTC-USD" ou "TTE.PA", contient des
+    // caractères qui perturbent l'analyseur de requête de GDELT et faisaient échouer la recherche)
+    const term = asset.quoteType === "CRYPTOCURRENCY" ? `${asset.name} cryptomonnaie` : asset.name;
     const encoded = encodeURIComponent(term);
     const artUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=artlist&maxrecords=6&format=json&sort=datedesc&timespan=3d`;
     const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=timelinetone&format=json&timespan=7d`;
 
-    const [artResult, toneResult] = await Promise.allSettled([fetchJSON(artUrl), fetchJSON(toneUrl)]);
+    // Appels séquentiels (pas en parallèle) pour éviter de saturer les proxys CORS gratuits
+    // qui limitent le nombre de requêtes simultanées.
+    let artResult, toneResult;
+    try {
+      artResult = { status: "fulfilled", value: await fetchJSON(artUrl) };
+    } catch (e) {
+      artResult = { status: "rejected", reason: e };
+    }
+    try {
+      toneResult = { status: "fulfilled", value: await fetchJSON(toneUrl) };
+    } catch (e) {
+      toneResult = { status: "rejected", reason: e };
+    }
 
     if (artResult.status === "rejected" && toneResult.status === "rejected") {
       setNews(null);
@@ -1064,7 +1080,12 @@ export default function App() {
           ) : newsLoading ? (
             <div className="bsl-news-empty"><Loader2 size={13} className="bsl-spin" style={{ verticalAlign: "middle", marginRight: 6 }} /> Recherche d'articles…</div>
           ) : newsError ? (
-            <div className="bsl-news-empty">{newsError}</div>
+            <div className="bsl-news-empty">
+              {newsError}{" "}
+              <button type="button" className="bsl-retry-btn" onClick={() => loadNews(selected)}>
+                Réessayer
+              </button>
+            </div>
           ) : news && news.articles.length > 0 ? (
             <ul className="bsl-news-list">
               {news.articles.slice(0, 5).map((a, i) => (
