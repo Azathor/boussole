@@ -80,35 +80,51 @@ function avatarGradient(symbol) {
 
 // ---------- network helpers ----------
 
-async function fetchWithTimeout(url, ms = 5000) {
+async function fetchWithTimeout(url, ms = 5000, asText = false) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
     const res = await fetch(url, { signal: ctrl.signal });
     if (!res.ok) throw new Error("http_" + res.status);
-    return await res.json();
+    return asText ? await res.text() : await res.json();
   } finally {
     clearTimeout(id);
   }
 }
 
-async function fetchJSON(url) {
-  const attempts = [
+function proxyAttempts(url) {
+  return [
     url,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
   ];
+}
+
+async function fetchJSON(url) {
   let lastErr;
-  for (const attemptUrl of attempts) {
+  for (const attemptUrl of proxyAttempts(url)) {
     try {
-      return await fetchWithTimeout(attemptUrl, 5000);
+      return await fetchWithTimeout(attemptUrl, 5000, false);
     } catch (e) {
       lastErr = e;
     }
   }
   throw lastErr;
 }
+
+async function fetchTextResource(url) {
+  let lastErr;
+  for (const attemptUrl of proxyAttempts(url)) {
+    try {
+      return await fetchWithTimeout(attemptUrl, 5000, true);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
 
 async function searchYahoo(q) {
   const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(
@@ -194,14 +210,12 @@ function formatTick(ts, tf) {
   return d.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" });
 }
 
-function parseGdeltDate(s) {
-  if (!s || s.length < 15) return null;
-  const iso = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(9, 11)}:${s.slice(
-    11,
-    13
-  )}:${s.slice(13, 15)}Z`;
-  const d = new Date(iso);
-  return isNaN(d.getTime()) ? null : d;
+function cleanRssTitle(title, source) {
+  if (!title) return "";
+  if (source && title.endsWith(` - ${source}`)) {
+    return title.slice(0, -(source.length + 3));
+  }
+  return title;
 }
 
 function paramsFor(tf) {
@@ -290,40 +304,44 @@ function computeTechnicalFactors(prices) {
   return { factors, score, pctChange, rsiVal };
 }
 
+// Le flux RSS ne fournit pas de score de sentiment (contrairement à l'ancienne source GDELT) —
+// ce facteur reste donc purement informatif (dir = 0), sans influencer le signal Achat/Vente.
 function buildNewsFactor(news, newsLoading, newsError) {
   if (newsLoading) {
-    return { dir: 0, factor: { label: "Sentiment des news (GDELT)", detail: "Analyse des actualités en cours…", dir: 0 } };
+    return {
+      dir: 0,
+      factor: { label: "Couverture médiatique", detail: "Recherche des actualités récentes en cours…", dir: 0 },
+    };
   }
   if (newsError || !news) {
     return {
       dir: 0,
       factor: {
-        label: "Sentiment des news (GDELT)",
-        detail: "Couverture médiatique indisponible pour le moment — facteur neutre par défaut.",
+        label: "Couverture médiatique",
+        detail: "Actualités indisponibles pour le moment — facteur non pris en compte dans le score.",
         dir: 0,
       },
     };
   }
-  const { avgTone, articles } = news;
-  if (avgTone == null || articles.length === 0) {
+  const count = news.articles?.length || 0;
+  if (count === 0) {
     return {
       dir: 0,
       factor: {
-        label: "Sentiment des news (GDELT)",
-        detail: "Peu ou pas de couverture médiatique récente détectée — facteur neutre.",
+        label: "Couverture médiatique",
+        detail: "Aucun article récent trouvé pour cet actif.",
         dir: 0,
       },
     };
   }
-  const dir = avgTone > 1 ? 1 : avgTone < -1 ? -1 : 0;
   return {
-    dir,
+    dir: 0,
     factor: {
-      label: "Sentiment des news (GDELT)",
-      detail: `Ton moyen des ${articles.length} derniers articles : ${avgTone.toFixed(1)} (échelle GDELT, positif > 0) — ${
-        dir > 0 ? "couverture plutôt positive." : dir < 0 ? "couverture plutôt négative." : "couverture globalement neutre."
-      }`,
-      dir,
+      label: "Couverture médiatique",
+      detail: `${count} article${count > 1 ? "s" : ""} récent${count > 1 ? "s" : ""} trouvé${
+        count > 1 ? "s" : ""
+      } — à consulter ci-dessous pour le contexte (non intégré au score technique, qui reste purement basé sur le prix).`,
+      dir: 0,
     },
   };
 }
@@ -623,55 +641,33 @@ export default function App() {
   async function loadNews(asset) {
     setNewsLoading(true);
     setNewsError(null);
-    // On utilise uniquement le nom (le symbole, ex. "BTC-USD" ou "TTE.PA", contient des
-    // caractères qui perturbent l'analyseur de requête de GDELT et faisaient échouer la recherche)
-    const term = asset.quoteType === "CRYPTOCURRENCY" ? `${asset.name} cryptomonnaie` : asset.name;
-    const encoded = encodeURIComponent(term);
-    const artUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=artlist&maxrecords=6&format=json&sort=datedesc&timespan=3d`;
-    const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=timelinetone&format=json&timespan=7d`;
-
-    // Appels séquentiels (pas en parallèle) pour éviter de saturer les proxys CORS gratuits
-    // qui limitent le nombre de requêtes simultanées.
-    let artResult, toneResult;
     try {
-      artResult = { status: "fulfilled", value: await fetchJSON(artUrl) };
-    } catch (e) {
-      artResult = { status: "rejected", reason: e };
-    }
-    try {
-      toneResult = { status: "fulfilled", value: await fetchJSON(toneUrl) };
-    } catch (e) {
-      toneResult = { status: "rejected", reason: e };
-    }
-
-    if (artResult.status === "rejected" && toneResult.status === "rejected") {
+      const term = asset.quoteType === "CRYPTOCURRENCY" ? `${asset.name} cryptomonnaie` : asset.name;
+      const url = `https://news.google.com/rss/search?q=${encodeURIComponent(term)}&hl=fr&gl=FR&ceid=FR:fr`;
+      const xmlText = await fetchTextResource(url);
+      const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+      if (doc.querySelector("parsererror")) throw new Error("flux illisible");
+      const articles = Array.from(doc.querySelectorAll("item"))
+        .slice(0, 6)
+        .map((item) => {
+          const rawTitle = item.querySelector("title")?.textContent || "";
+          const source = item.querySelector("source")?.textContent || "";
+          const link = item.querySelector("link")?.textContent || "";
+          const pubDate = item.querySelector("pubDate")?.textContent || "";
+          return {
+            title: cleanRssTitle(rawTitle, source),
+            url: link,
+            domain: source,
+            date: pubDate ? new Date(pubDate) : null,
+          };
+        });
+      setNews({ articles });
+    } catch (err) {
       setNews(null);
       setNewsError("Actualités indisponibles pour le moment.");
+    } finally {
       setNewsLoading(false);
-      return;
     }
-
-    const articles =
-      artResult.status === "fulfilled"
-        ? (artResult.value.articles || []).map((a) => ({
-            title: a.title,
-            url: a.url,
-            domain: a.domain,
-            date: parseGdeltDate(a.seendate),
-          }))
-        : [];
-
-    let avgTone = null;
-    if (toneResult.status === "fulfilled") {
-      const toneSeries = toneResult.value?.timeline?.[0]?.data || [];
-      avgTone = toneSeries.length
-        ? toneSeries.reduce((sum, d) => sum + (d.value || 0), 0) / toneSeries.length
-        : null;
-    }
-
-    setNews({ articles, avgTone });
-    setNewsError(null);
-    setNewsLoading(false);
   }
 
   function handleSelect(item) {
@@ -688,7 +684,7 @@ export default function App() {
     if (!technical) return null;
     const factors = [...technical.factors, newsFactorInfo.factor];
     const score = technical.score + newsFactorInfo.dir;
-    const maxAbs = 5;
+    const maxAbs = 4;
     let signal = "Neutre";
     if (score >= 2) signal = "Achat";
     else if (score <= -2) signal = "Vente";
