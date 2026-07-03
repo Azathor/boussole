@@ -18,6 +18,7 @@ import {
   ExternalLink,
   Radio,
   X,
+  Star,
 } from "lucide-react";
 
 const TIMEFRAMES = [
@@ -539,6 +540,38 @@ export default function App() {
   const [newsError, setNewsError] = useState(null);
   const [demoActive, setDemoActive] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
+  const [favorites, setFavorites] = useState(() => {
+    try {
+      const raw = localStorage.getItem("boussole:favorites");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("boussole:favorites", JSON.stringify(favorites));
+    } catch {
+      // stockage indisponible (navigation privée, etc.) — on ignore silencieusement
+    }
+  }, [favorites]);
+
+  const isFavorite = !!(selected && favorites.some((f) => f.symbol === selected.symbol));
+
+  function toggleFavorite() {
+    if (!selected) return;
+    setFavorites((prev) =>
+      prev.some((f) => f.symbol === selected.symbol)
+        ? prev.filter((f) => f.symbol !== selected.symbol)
+        : [...prev, { symbol: selected.symbol, name: selected.name, quoteType: selected.quoteType }]
+    );
+  }
+
+  function selectFavorite(fav) {
+    setSelected(fav);
+    setQuery(`${fav.name} (${fav.symbol})`);
+  }
 
   useEffect(() => {
     if (!selected) return;
@@ -588,29 +621,41 @@ export default function App() {
   async function loadNews(asset) {
     setNewsLoading(true);
     setNewsError(null);
-    try {
-      const term = `${asset.name} ${asset.symbol}`;
-      const encoded = encodeURIComponent(term);
-      const artUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=artlist&maxrecords=6&format=json&sort=datedesc&timespan=3d`;
-      const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=timelinetone&format=json&timespan=7d`;
-      const [artData, toneData] = await Promise.all([fetchJSON(artUrl), fetchJSON(toneUrl)]);
-      const articles = (artData.articles || []).map((a) => ({
-        title: a.title,
-        url: a.url,
-        domain: a.domain,
-        date: parseGdeltDate(a.seendate),
-      }));
-      const toneSeries = toneData?.timeline?.[0]?.data || [];
-      const avgTone = toneSeries.length
-        ? toneSeries.reduce((sum, d) => sum + (d.value || 0), 0) / toneSeries.length
-        : null;
-      setNews({ articles, avgTone });
-    } catch (err) {
+    const term = `${asset.name} ${asset.symbol}`;
+    const encoded = encodeURIComponent(term);
+    const artUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=artlist&maxrecords=6&format=json&sort=datedesc&timespan=3d`;
+    const toneUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encoded}&mode=timelinetone&format=json&timespan=7d`;
+
+    const [artResult, toneResult] = await Promise.allSettled([fetchJSON(artUrl), fetchJSON(toneUrl)]);
+
+    if (artResult.status === "rejected" && toneResult.status === "rejected") {
       setNews(null);
       setNewsError("Actualités indisponibles pour le moment.");
-    } finally {
       setNewsLoading(false);
+      return;
     }
+
+    const articles =
+      artResult.status === "fulfilled"
+        ? (artResult.value.articles || []).map((a) => ({
+            title: a.title,
+            url: a.url,
+            domain: a.domain,
+            date: parseGdeltDate(a.seendate),
+          }))
+        : [];
+
+    let avgTone = null;
+    if (toneResult.status === "fulfilled") {
+      const toneSeries = toneResult.value?.timeline?.[0]?.data || [];
+      avgTone = toneSeries.length
+        ? toneSeries.reduce((sum, d) => sum + (d.value || 0), 0) / toneSeries.length
+        : null;
+    }
+
+    setNews({ articles, avgTone });
+    setNewsError(null);
+    setNewsLoading(false);
   }
 
   function handleSelect(item) {
@@ -709,6 +754,23 @@ export default function App() {
         }
         .bsl-search-trigger:hover, .bsl-search-trigger:focus-visible { border-color: rgba(79,216,234,0.4); outline: none; }
         .bsl-search-trigger .val { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .bsl-favorites { display: flex; gap: 6px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+        .bsl-favorites::-webkit-scrollbar { display: none; }
+        .bsl-fav-chip {
+          display: flex; align-items: center; gap: 5px; flex-shrink: 0; background: rgba(245,185,66,0.08);
+          border: 1px solid rgba(245,185,66,0.25); color: var(--neutral); font-size: 12px; font-family: var(--font-mono);
+          padding: 6px 11px; border-radius: 999px; cursor: pointer; min-height: 30px; transition: all 0.15s;
+        }
+        .bsl-fav-chip:hover { background: rgba(245,185,66,0.16); }
+        .bsl-fav-chip.active { background: linear-gradient(120deg, var(--cyan), var(--purple)); border-color: transparent; color: #08101f; font-weight: 700; }
+
+        .bsl-fav-toggle {
+          background: transparent; border: none; color: var(--text-dim); cursor: pointer; padding: 4px;
+          display: flex; align-items: center; border-radius: 6px; flex-shrink: 0;
+        }
+        .bsl-fav-toggle:hover { color: var(--neutral); }
+        .bsl-fav-toggle.active { color: var(--neutral); }
 
         .bsl-modal-overlay {
           position: fixed; inset: 0; background: rgba(4,6,18,0.72); backdrop-filter: blur(6px);
@@ -861,6 +923,20 @@ export default function App() {
           <Search size={16} />
           <span className="val">{query || "Rechercher une action, un ETF, une crypto…"}</span>
         </button>
+        {favorites.length > 0 && (
+          <div className="bsl-favorites">
+            {favorites.map((f) => (
+              <button
+                key={f.symbol}
+                type="button"
+                className={`bsl-fav-chip ${selected?.symbol === f.symbol ? "active" : ""}`}
+                onClick={() => selectFavorite(f)}
+              >
+                <Star size={11} fill="currentColor" /> {f.symbol}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="bsl-timeframes">
@@ -899,6 +975,15 @@ export default function App() {
                 <>
                   {selected.name} · {selected.symbol}
                   <span className={`bsl-type-pill ${selected.quoteType}`}>{typeLabel(selected.quoteType)}</span>
+                  <button
+                    type="button"
+                    className={`bsl-fav-toggle ${isFavorite ? "active" : ""}`}
+                    onClick={toggleFavorite}
+                    aria-label={isFavorite ? "Retirer des favoris" : "Ajouter aux favoris"}
+                    title={isFavorite ? "Retirer des favoris" : "Ajouter aux favoris"}
+                  >
+                    <Star size={14} fill={isFavorite ? "currentColor" : "none"} />
+                  </button>
                 </>
               ) : (
                 "En attente"
